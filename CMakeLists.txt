@@ -1,9 +1,6 @@
-cmake_minimum_required (VERSION 3.10..3.20)
-if(POLICY CMP0073)
-  cmake_policy(SET CMP0073 NEW)
-endif()
-if(POLICY CMP0074)
-  cmake_policy(SET CMP0074 NEW)
+cmake_minimum_required (VERSION 3.16..3.28)
+if(POLICY CMP0135)
+  cmake_policy(SET CMP0135 NEW)
 endif()
 project (opendht)
 
@@ -13,9 +10,10 @@ include(CheckIncludeFileCXX)
 include(FindPkgConfig)
 include(cmake/CheckAtomic.cmake)
 include(CTest)
+include(FetchContent)
 
-set (opendht_VERSION_MAJOR 2)
-set (opendht_VERSION_MINOR 6.0)
+set (opendht_VERSION_MAJOR 3)
+set (opendht_VERSION_MINOR 2.0)
 set (opendht_VERSION ${opendht_VERSION_MAJOR}.${opendht_VERSION_MINOR})
 set (PACKAGE_VERSION ${opendht_VERSION})
 set (VERSION "${opendht_VERSION}")
@@ -47,7 +45,9 @@ set (CMAKE_CXX_STANDARD 17)
 set (CMAKE_CXX_STANDARD_REQUIRED on)
 
 # Dependencies
-if (NOT HAVE_CXX_ATOMICS_WITHOUT_LIB)
+if (NOT HAVE_CXX_ATOMICS_WITHOUT_LIB
+        # For ARM EABI (armel), little-endian MIPS (mipsel), etc.
+        OR NOT HAVE_CXX_ATOMICS64_WITHOUT_LIB)
     link_libraries (atomic)
 endif ()
 
@@ -85,15 +85,44 @@ if (NOT MSVC)
 
     if (OPENDHT_HTTP OR OPENDHT_PEER_DISCOVERY)
         find_path(ASIO_INCLUDE_DIR asio.hpp REQUIRED)
+        message(STATUS "Found ASIO ${ASIO_INCLUDE_DIR}")
+    else()
+        message(STATUS "ASIO not required")
     endif ()
 
     find_package(fmt)
 
     if (OPENDHT_HTTP)
         find_package(Restinio REQUIRED)
-        find_library(HTTP_PARSER_LIBRARY http_parser)
-        add_library(http_parser SHARED IMPORTED)
-        set(http_parser_lib "-lhttp_parser")
+
+        # llhttp
+        find_path(LLHTTP_INCLUDE_DIR llhttp.h)
+        find_library(LLHTTP_LIBRARY libllhttp)
+        if (LLHTTP_INCLUDE_DIR AND LLHTTP_LIBRARY)
+            message(STATUS "Found llhttp ${LLHTTP_INCLUDE_DIR} ${LLHTTP_LIBRARY}")
+            add_library(llhttp_static STATIC IMPORTED)
+            set_target_properties(llhttp_static PROPERTIES
+                IMPORTED_LOCATION ${LLHTTP_LIBRARY}
+                INTERFACE_INCLUDE_DIRECTORIES ${LLHTTP_INCLUDE_DIR}
+            )
+            set(llhttp_target llhttp_static)
+        else()
+            FetchContent_Declare(llhttp-local URL "https://github.com/nodejs/llhttp/archive/refs/tags/release/v9.2.0.tar.gz")
+            if (BUILD_SHARED_LIBS)
+                set(BUILD_SHARED_LIBS ON CACHE INTERNAL "")
+            else()
+                set(BUILD_SHARED_LIBS OFF CACHE INTERNAL "")
+                set(BUILD_STATIC_LIBS ON CACHE INTERNAL "")
+            endif()
+            FetchContent_MakeAvailable(llhttp-local)
+            if (BUILD_SHARED_LIBS)
+                set(llhttp_target llhttp_shared)
+            else()
+                set(llhttp_target llhttp_static)
+            endif()
+        endif()
+        set(http_lib "-lllhttp")
+        
         if (NOT Jsoncpp_FOUND)
             message(SEND_ERROR "Jsoncpp is required for DHT proxy support")
         endif()
@@ -134,6 +163,9 @@ endif ()
 
 if (OPENDHT_HTTP OR OPENDHT_PEER_DISCOVERY)
     add_definitions(-DASIO_STANDALONE)
+    if (UNIX AND NOT APPLE)
+        pkg_search_module(liburing IMPORTED_TARGET liburing)
+    endif ()
 endif()
 
 if (NOT MSVC)
@@ -208,6 +240,7 @@ list (APPEND opendht_SOURCES
 )
 
 list (APPEND opendht_HEADERS
+    include/opendht.h
     include/opendht/def.h
     include/opendht/utils.h
     include/opendht/sockaddr.h
@@ -348,7 +381,7 @@ if (NOT HAVE_MSGPACKCXX)
     target_link_libraries(opendht PUBLIC ${MSGPACK_TARGET})
 endif()
 if (APPLE)
-    target_link_libraries(opendht PRIVATE SYSTEM "-framework CoreFoundation" "-framework Security")
+    target_link_libraries(opendht PRIVATE "-framework CoreFoundation" "-framework Security")
 endif()
 if (MSVC)
     if (OPENDHT_STATIC)
@@ -360,17 +393,24 @@ else()
         PRIVATE
             PkgConfig::argon2
             PkgConfig::Nettle
-            ${HTTP_PARSER_LIBRARY}
         PUBLIC
             ${CMAKE_THREAD_LIBS_INIT}
             PkgConfig::GnuTLS
             fmt::fmt
     )
+    if (OPENDHT_HTTP)
+        target_link_libraries(opendht PUBLIC ${llhttp_target})
+    endif()
     if (Jsoncpp_FOUND)
         target_link_libraries(opendht PUBLIC PkgConfig::Jsoncpp)
     endif()
     if (OPENDHT_PROXY_OPENSSL)
         target_link_libraries(opendht PUBLIC PkgConfig::OPENSSL)
+    endif()
+    if (liburing_FOUND)
+        set(iouring_lib ", liburing")
+        target_link_libraries(opendht PUBLIC PkgConfig::liburing)
+        target_compile_definitions(opendht PUBLIC ASIO_HAS_IO_URING ASIO_DISABLE_EPOLL)
     endif()
 endif()
 

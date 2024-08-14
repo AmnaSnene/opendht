@@ -23,9 +23,8 @@
 #include "op_cache.h"
 #include "utils.h"
 
-#include <http_parser.h>
+#include <llhttp.h>
 #include <deque>
-
 
 namespace dht {
 
@@ -98,7 +97,7 @@ std::string
 getRandomSessionId(size_t length = 8) {
     static constexpr const char chars[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!#$%&()*+,./:;<=>?@[]^_`{|}~";
     std::string str(length, 0);
-    crypto::random_device rdev;
+    std::random_device rdev;
     std::uniform_int_distribution<> dist(0, (sizeof(chars)/sizeof(char)) - 2);
     std::generate_n( str.begin(), length, [&]{ return chars[dist(rdev)]; } );
     return str;
@@ -191,10 +190,12 @@ void
 DhtProxyClient::stop()
 {
     if (not isDestroying_.exchange(true)) {
+        std::shared_ptr<http::Resolver> resolver;
         {
             std::lock_guard<std::mutex> l(resolverLock_);
-            resolver_.reset();
+            resolver = std::move(resolver_);
         }
+        resolver->cancel();
         cancelAllListeners();
         if (infoState_)
             infoState_->cancel = true;
@@ -491,7 +492,7 @@ void
 DhtProxyClient::doPut(const InfoHash& key, Sp<Value> val, DoneCallbackSimple cb, time_point /*created*/, bool permanent)
 {
     if (logger_)
-        logger_->d("[proxy:client] [put] [search %s] executing for %s", key.to_c_str(), val->toString().c_str());
+        logger_->debug("[proxy:client] [put] [search {}] executing for {}", key, val->toString());
 
     try {
         auto request = buildRequest("/key/" + key.toString());
@@ -539,12 +540,12 @@ DhtProxyClient::doPut(const InfoHash& key, Sp<Value> val, DoneCallbackSimple cb,
                         }
                     } else {
                         if (logger_)
-                            logger_->e("[proxy:client] [status] failed to parse value from  server", response.status_code);
+                            logger_->error("[proxy:client] [put] failed to parse value from server: {}", err);
                     }
                 }
             } else {
                 if (logger_)
-                    logger_->e("[proxy:client] [status] failed with code=%i", response.status_code);
+                    logger_->error("[proxy:client] [put] failed with code={:d}", response.status_code);
                 if (not response.aborted and response.status_code == 0)
                     opFailed();
             }
@@ -563,7 +564,8 @@ DhtProxyClient::doPut(const InfoHash& key, Sp<Value> val, DoneCallbackSimple cb,
     }
     catch (const std::exception &e){
         if (logger_)
-            logger_->e("[proxy:client] [put %s] error: %s", key.to_c_str(), e.what());
+            logger_->error("[proxy:client] [put {}] error: {}", key, e.what());
+        opFailed();
     }
 }
 
@@ -721,7 +723,7 @@ DhtProxyClient::onProxyInfos(const Json::Value& proxyInfos, const sa_family_t fa
         }
     } else {
         if (logger_)
-            logger_->d("[proxy:client] [info] got proxy reply for %s",
+            logger_->debug("[proxy:client] [info] got proxy reply for {}",
                        family == AF_INET ? "ipv4" : "ipv6");
         try {
             myid = InfoHash(proxyInfos["node_id"].asString());
@@ -729,6 +731,7 @@ DhtProxyClient::onProxyInfos(const Json::Value& proxyInfos, const sa_family_t fa
             stats6_ = NodeStats(proxyInfos["ipv6"]);
             auto publicIp = parsePublicAddress(proxyInfos["public_ip"]);
             ipChanged = pubAddress && pubAddress.toString() != publicIp.toString();
+            bool pub = ipChanged || !pubAddress;
             pubAddress = publicIp;
 
             if (proxyInfos.isMember("local_ip")) {
@@ -737,6 +740,18 @@ DhtProxyClient::onProxyInfos(const Json::Value& proxyInfos, const sa_family_t fa
                     localAddress.setAddress(localIp.c_str());
                     ipChanged = (bool)localAddress;
                 }
+            }
+
+            if (pub && publicAddressChangedCb_) {
+                std::vector<SockAddr> addresses;
+                if (publicAddressV4_)
+                    addresses.emplace_back(publicAddressV4_);
+                if (publicAddressV6_)
+                    addresses.emplace_back(publicAddressV6_);
+                std::lock_guard<std::mutex> lock(lockCallbacks_);
+                callbacks_.emplace_back([cb=publicAddressChangedCb_, addresses = std::move(addresses)](){
+                    cb(std::move(addresses));
+                });
             }
 
             if (!ipChanged && stats4_.good_nodes + stats6_.good_nodes)
@@ -995,7 +1010,10 @@ DhtProxyClient::handleExpireListener(const asio::error_code &ec, const InfoHash&
             }
         } else {
             // stop the request
-            listener.request.reset();
+            if (listener.request) {
+                listener.request->cancel();
+                listener.request.reset();
+            }
         }
         search->second.listeners.erase(it);
         if (logger_)
@@ -1090,6 +1108,12 @@ DhtProxyClient::sendListen(const restinio::http_request_header_t& header,
             std::lock_guard<std::mutex> l(requestLock_);
             requests_[reqid] = request;
         }
+        request->add_on_status_callback([request, seconds = this->listenKeepIdle()] (unsigned status_code) {
+            if(status_code == 200) {
+                // increase TCP_KEEPIDLE to save power
+                request->get_connection()->set_keepalive(seconds);
+            }
+        });
         request->send();
     }
     catch (const std::exception &e){
@@ -1141,7 +1165,7 @@ DhtProxyClient::restartListeners(const asio::error_code &ec)
 
     std::lock_guard<std::mutex> lock(searchLock_);
     for (auto& search : searches_) {
-        auto key = search.first;
+        const auto& key = search.first;
         for (auto& put : search.second.puts) {
             doPut(key, put.second.value, [ok = put.second.ok](bool result){
                 *ok = result;
@@ -1152,6 +1176,10 @@ DhtProxyClient::restartListeners(const asio::error_code &ec)
             put.second.refreshPutTimer->expires_at(std::chrono::steady_clock::now() + proxy::OP_TIMEOUT - proxy::OP_MARGIN);
             put.second.refreshPutTimer->async_wait(std::bind(&DhtProxyClient::handleRefreshPut, this,
                                                    std::placeholders::_1, key, put.first));
+        }
+        // Restart failed pending puts
+        for (auto& pput : search.second.pendingPuts) {
+            doPut(key, pput, {}, time_point::max(), true);
         }
     }
     if (not deviceKey_.empty()) {
@@ -1193,7 +1221,7 @@ DhtProxyClient::restartListeners(const asio::error_code &ec)
 }
 
 void
-DhtProxyClient::pushNotificationReceived(const std::map<std::string, std::string>& notification)
+DhtProxyClient::pushNotificationReceived([[maybe_unused]] const std::map<std::string, std::string>& notification)
 {
 #ifdef OPENDHT_PUSH_NOTIFICATIONS
     {
@@ -1292,13 +1320,11 @@ DhtProxyClient::pushNotificationReceived(const std::map<std::string, std::string
     }
     if (launchLoop)
         loopSignal_();
-#else
-    (void) notification;
 #endif
 }
 
 void
-DhtProxyClient::resubscribe(const InfoHash& key, const size_t token, Listener& listener)
+DhtProxyClient::resubscribe([[maybe_unused]] const InfoHash& key, [[maybe_unused]] const size_t token, [[maybe_unused]] Listener& listener)
 {
 #ifdef OPENDHT_PUSH_NOTIFICATIONS
     if (deviceKey_.empty())
@@ -1322,9 +1348,6 @@ DhtProxyClient::resubscribe(const InfoHash& key, const size_t token, Listener& l
                                                 std::placeholders::_1, key, token, opstate));
     auto vcb = listener.cb;
     sendListen(header, vcb, opstate, listener, ListenMethod::RESUBSCRIBE);
-#else
-    (void) key;
-    (void) listener;
 #endif
 }
 

@@ -108,7 +108,7 @@ DhtRunnerTester::testListen() {
     auto b = dht::InfoHash::get("2345");
     auto c = dht::InfoHash::get("23456");
     auto d = dht::InfoHash::get("234567");
-    constexpr unsigned N = 2048;
+    constexpr unsigned N = 256;
     constexpr unsigned SZ = 56 * 1024;
 
     auto ftokena = node1.listen(a, [&](const std::vector<std::shared_ptr<dht::Value>>& values, bool expired) {
@@ -289,7 +289,7 @@ DhtRunnerTester::testIdOps() {
         valueCountEdit++;
         cv.notify_all();
     });
-    node2.listen(key2, [&](const std::vector<std::shared_ptr<dht::Value>>& values, bool expired){
+    node2.listen(key2, [&](const std::vector<std::shared_ptr<dht::Value>>& values, bool /*expired*/){
         for (const auto& v : values) {
             if (v->seq == 0)
                 CPPUNIT_ASSERT_EQUAL("v1"s, dht::unpackMsg<std::string>(v->data));

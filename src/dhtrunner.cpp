@@ -167,7 +167,7 @@ DhtRunner::run(const Config& config, Context&& context)
                 outConfig << context.sock->getBoundRef(AF_INET).getPort() << std::endl;
                 outConfig << context.sock->getBoundRef(AF_INET6).getPort() << std::endl;
             }
-            auto dht = std::make_unique<Dht>(std::move(context.sock), SecureDht::getConfig(config.dht_config), context.logger);
+            auto dht = std::make_unique<Dht>(std::move(context.sock), SecureDht::getConfig(config.dht_config), context.logger, std::move(context.rng));
             dht_ = std::make_unique<SecureDht>(std::move(dht), config.dht_config, std::move(context.identityAnnouncedCb), context.logger);
         } else {
             enableProxy(true);
@@ -180,11 +180,14 @@ DhtRunner::run(const Config& config, Context&& context)
         throw;
     }
 
-    if (context.statusChangedCallback) {
-        statusCb = std::move(context.statusChangedCallback);
-    }
+    statusCbs.clear();
+    if (context.statusChangedCallback)
+        statusCbs.emplace_back(std::move(context.statusChangedCallback));
     if (context.certificateStore) {
         dht_->setLocalCertificateStore(std::move(context.certificateStore));
+    }
+    if (context.publicAddressChangedCb) {
+        dht_->setOnPublicAddressChanged(std::move(context.publicAddressChangedCb));
     }
 
     if (not config.threaded)
@@ -207,7 +210,7 @@ DhtRunner::run(const Config& config, Context&& context)
                     if (not pending_ops_prio.empty())
                         return true;
                     auto s = getStatus();
-                    if (not pending_ops.empty() and (s == NodeStatus::Connected or s == NodeStatus::Disconnected))
+                    if (not pending_ops.empty() and (s == NodeStatus::Connected or s == NodeStatus::Disconnected or running == State::Stopping))
                         return true;
                 }
                 return false;
@@ -261,6 +264,17 @@ DhtRunner::run(const Config& config, Context&& context)
                 }
             }
         }
+        if (peerDiscovery_) {
+            statusCbs.emplace_back([this](NodeStatus status4, NodeStatus status6) {
+                if (status4 == NodeStatus::Disconnected && status6 == NodeStatus::Disconnected) {
+                    peerDiscovery_->connectivityChanged();
+                }
+                else if (status4 != NodeStatus::Connected || status6 != NodeStatus::Connected) {
+                    peerDiscovery_->stopConnectivityChanged();
+                }
+
+            });
+        }
 #endif
     }
 }
@@ -281,7 +295,7 @@ DhtRunner::shutdown(ShutdownCallback cb, bool stop) {
         return;
     }
     if (logger_)
-        logger_->d("[runner %p] state changed to Stopping, %zu ongoing ops", fmt::ptr(this), ongoing_ops.load());
+        logger_->debug("[runner {:p}] state changed to Stopping, {:d} ongoing ops", fmt::ptr(this), ongoing_ops.load());
     ongoing_ops++;
     shutdownCallbacks_.emplace_back(std::move(cb));
     pending_ops.emplace([=](SecureDht&) mutable {
@@ -346,7 +360,7 @@ DhtRunner::join()
             if (auto sock = dht_->getSocket())
                 sock->stop();
         if (logger_)
-            logger_->d("[runner %p] state changed to Idle", fmt::ptr(this));
+            logger_->debug("[runner {:p}] state changed to Idle", fmt::ptr(this));
     }
 
     if (dht_thread.joinable())
@@ -355,7 +369,7 @@ DhtRunner::join()
     {
         std::lock_guard<std::mutex> lck(storage_mtx);
         if (ongoing_ops and logger_) {
-            logger_->w("[runner %p] stopping with %zu remaining ops", fmt::ptr(this), ongoing_ops.load());
+            logger_->warn("[runner {:p}] stopping with {:d} remaining ops", fmt::ptr(this), ongoing_ops.load());
         }
         pending_ops = decltype(pending_ops)();
         pending_ops_prio = decltype(pending_ops_prio)();
@@ -627,7 +641,7 @@ DhtRunner::loop_()
     {
         std::lock_guard<std::mutex> lck(storage_mtx);
         auto s = getStatus();
-        ops = (pending_ops_prio.empty() && (s == NodeStatus::Connected or s == NodeStatus::Disconnected)) ?
+        ops = (pending_ops_prio.empty() && (s == NodeStatus::Connected or s == NodeStatus::Disconnected or running == State::Stopping)) ?
                std::move(pending_ops) : std::move(pending_ops_prio);
     }
     while (not ops.empty()) {
@@ -687,8 +701,9 @@ DhtRunner::loop_()
     if (nstatus4 != status4 || nstatus6 != status6) {
         status4 = nstatus4;
         status6 = nstatus6;
-        if (statusCb)
-            statusCb(status4, status6);
+        for (auto& cb : statusCbs){
+            cb(status4, status6);
+        }
     }
 
     return wakeup;

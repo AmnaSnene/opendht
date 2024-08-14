@@ -65,7 +65,7 @@ public:
      * Initialise the Dht with two open sockets (for IPv4 and IP6)
      * and an ID for the node.
      */
-    Dht(std::unique_ptr<net::DatagramSocket>&& sock, const Config& config, const Sp<Logger>& l = {});
+    Dht(std::unique_ptr<net::DatagramSocket>&& sock, const Config& config, const Sp<Logger>& l = {}, std::unique_ptr<std::mt19937_64>&& rd = {});
 
     virtual ~Dht();
 
@@ -73,6 +73,9 @@ public:
      * Get the ID of the node.
      */
     inline const InfoHash& getNodeId() const override { return myid; }
+    void setOnPublicAddressChanged(PublicAddressChangedCb cb) override {
+        publicAddressChangedCb_ = std::move(cb);
+    }
 
     NodeStatus updateStatus(sa_family_t af) override;
 
@@ -262,7 +265,6 @@ public:
      */
     void connectivityChanged(sa_family_t) override;
     void connectivityChanged() override {
-        reported_addr.clear();
         connectivityChanged(AF_INET);
         connectivityChanged(AF_INET6);
     }
@@ -370,7 +372,7 @@ private:
     Dht(const Dht&) = delete;
     Dht& operator=(const Dht&) = delete;
 
-    std::mt19937_64 rd {crypto::getSeededRandomEngine<std::mt19937_64>()};
+    std::mt19937_64 rd;
 
     InfoHash myid {};
 
@@ -381,11 +383,14 @@ private:
     TypeStore types;
 
     using SearchMap = std::map<InfoHash, Sp<Search>>;
+    using ReportedAddr = std::pair<unsigned, SockAddr>;
+
     struct Kad {
         RoutingTable buckets {};
         SearchMap searches {};
         unsigned pending_pings {0};
         NodeStatus status;
+        std::vector<ReportedAddr> reported_addr;
 
         NodeStatus getStatus(time_point now) const;
         NodeStats getNodesStats(time_point now, const InfoHash& myid) const;
@@ -393,6 +398,7 @@ private:
 
     Kad dht4 {};
     Kad dht6 {};
+    PublicAddressChangedCb publicAddressChangedCb_ {};
 
     std::vector<std::pair<std::string,std::string>> bootstrap_nodes {};
     std::chrono::steady_clock::duration bootstrap_period {BOOTSTRAP_PERIOD};
@@ -420,8 +426,6 @@ private:
     Sp<Scheduler::Job> nextStorageMaintenance {};
 
     net::NetworkEngine network_engine;
-    using ReportedAddr = std::pair<unsigned, SockAddr>;
-    std::vector<ReportedAddr> reported_addr;
 
     std::string persistPath;
 
@@ -564,7 +568,7 @@ private:
      * @param sr  The search for which we want to announce a value.
      * @param announce  The 'announce' structure.
      */
-    void searchSendAnnounceValue(const Sp<Search>& sr);
+    void searchSendAnnounceValue(const Sp<Search>& sr, unsigned syncLevel = TARGET_NODES);
 
     /**
      * Main process of a Search's operations. This function will demand the

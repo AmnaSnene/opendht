@@ -24,7 +24,7 @@
 
 #include <asio.hpp>
 #include <restinio/impl/tls_socket.hpp>
-#include <http_parser.h>
+#include <llhttp.h>
 #include <json/json.h>
 
 #include <openssl/ocsp.h>
@@ -32,6 +32,10 @@
 #include <openssl/asn1.h>
 #include <openssl/x509.h>
 #include <openssl/x509_vfy.h>
+
+#include <cctype>
+#include <iomanip>
+#include <sstream>
 
 #define MAXAGE_SEC (14*24*60*60)
 #define JITTER_SEC (60)
@@ -140,12 +144,12 @@ Connection::Connection(asio::io_context& ctx, const bool ssl, std::shared_ptr<dh
         ssl_ctx_ = newTlsClientContext(l);
         ssl_socket_ = std::make_unique<ssl_socket_t>(ctx_, ssl_ctx_);
         if (logger_)
-            logger_->d("[connection:%i] start https session with system CA", id_);
+            logger_->debug("[connection:{:d}] start https session with system CA", id_);
     }
     else {
         socket_ = std::make_unique<socket_t>(ctx);
         if (logger_)
-            logger_->d("[connection:%i] start http session", id_);
+            logger_->debug("[connection:{:d}] start http session", id_);
     }
 }
 
@@ -162,11 +166,11 @@ Connection::Connection(asio::io_context& ctx, std::shared_ptr<dht::crypto::Certi
         if (ec)
             throw std::runtime_error("Error adding certificate authority: " + ec.message());
         else if (logger_)
-            logger_->d("[connection:%i] start https with custom CA %s", id_, server_ca->getUID().c_str());
+            logger_->debug("[connection:{:d}] start https with custom CA {:s}", id_, server_ca->getUID());
     } else {
         ssl_ctx_ = newTlsClientContext(l);
         if (logger_)
-            logger_->d("[connection:%i] start https session with system CA", id_);
+            logger_->debug("[connection:{:d}] start https session with system CA", id_);
     }
     if (identity.first){
         auto key = identity.first->serialize();
@@ -181,7 +185,7 @@ Connection::Connection(asio::io_context& ctx, std::shared_ptr<dht::crypto::Certi
         if (ec)
             throw std::runtime_error("Error adding client certificate: " + ec.message());
         else if (logger_)
-            logger_->d("[connection:%i] client certificate %s", id_, identity.second->getUID().c_str());
+            logger_->debug("[connection:{:d}] client certificate {:s}", id_, identity.second->getUID());
     }
     ssl_socket_ = std::make_unique<ssl_socket_t>(ctx_, ssl_ctx_);
 }
@@ -204,7 +208,7 @@ Connection::close()
             socket_->close(ec);
     }
     if (ec and logger_)
-        logger_->e("[connection:%i] error closing: %s", id_, ec.message().c_str());
+        logger_->error("[connection:{:d}] error closing: {:s}", id_, ec.message());
 }
 
 bool
@@ -221,20 +225,25 @@ Connection::is_ssl() const
     return ssl_ctx_ ? true : false;
 }
 
-static time_t
-parse_ocsp_time(ASN1_GENERALIZEDTIME* gt)
-{
-    struct tm tm;
-    time_t rv = -1;
+std::string asn1ToString(ASN1_GENERALIZEDTIME* time) {
+    if (!time) {
+        return "(null)";
+    }
+    BIO* memBio = BIO_new(BIO_s_mem());
+    if (!memBio) {
+        throw std::runtime_error("Failed to create BIO");
+    }
 
-    if (gt == nullptr)
-        return -1;
-    // RFC 6960 specifies that all times in OCSP must be GENERALIZEDTIME
-    if (ASN1_time_parse((const char*)gt->data, gt->length, &tm, V_ASN1_GENERALIZEDTIME) == -1)
-        return -1;
-    if ((rv = timegm(&tm)) == -1)
-        return -1;
-    return rv;
+    if (ASN1_GENERALIZEDTIME_print(memBio, time) <= 0) {
+        BIO_free(memBio);
+        throw std::runtime_error("Failed to print ASN1_GENERALIZEDTIME");
+    }
+
+    char* bioData;
+    long bioLength = BIO_get_mem_data(memBio, &bioData);
+    std::string result(bioData, bioLength);
+    BIO_free(memBio);
+    return result;
 }
 
 static inline X509*
@@ -272,26 +281,26 @@ ocspRequestFromCert(STACK_OF(X509)* fullchain, const std::shared_ptr<Logger>& lo
 
     if (sk_X509_num(fullchain) <= 1) {
         if (logger)
-            logger->e("Cert does not contain a cert chain");
+            logger->error("Cert does not contain a cert chain");
         return {};
     }
     X509* cert = cert_from_chain(fullchain);
     if (cert == nullptr) {
         if (logger)
-            logger->e("No certificate found");
+            logger->error("No certificate found");
         return {};
     }
     X509* issuer = issuer_from_chain(fullchain);
     if (issuer == nullptr) {
         if (logger)
-            logger->e("Unable to find issuer for cert");
+            logger->error("Unable to find issuer for cert");
         return {};
     }
 
     auto urls = X509_get1_ocsp(cert);
     if (urls == nullptr || sk_OPENSSL_STRING_num(urls) <= 0) {
         if (logger)
-            logger->e("Certificate contains no OCSP url");
+            logger->error("Certificate contains no OCSP url");
         return {};
     }
     auto url = sk_OPENSSL_STRING_value(urls, 0);
@@ -306,12 +315,12 @@ ocspRequestFromCert(STACK_OF(X509)* fullchain, const std::shared_ptr<Logger>& lo
     OCSP_CERTID* id = OCSP_cert_to_id(EVP_sha1(), cert, issuer);
     if (id == nullptr) {
         if (logger)
-            logger->e("Unable to get certificate id from cert");
+            logger->error("Unable to get certificate id from cert");
         return {};
     }
     if (OCSP_request_add0_id(request->req.get(), id) == nullptr) {
         if (logger)
-            logger->e("Unable to add certificate id to request");
+            logger->error("Unable to add certificate id to request");
         return {};
     }
 
@@ -322,12 +331,12 @@ ocspRequestFromCert(STACK_OF(X509)* fullchain, const std::shared_ptr<Logger>& lo
     uint8_t* data {nullptr};
     if ((size = i2d_OCSP_REQUEST(request->req.get(), &data)) <= 0) {
         if (logger)
-            logger->e("Unable to encode ocsp request");
+            logger->error("Unable to encode ocsp request");
         return {};
     }
     if (data == nullptr) {
         if (logger)
-            logger->e("Unable to allocte memory");
+            logger->error("Unable to allocte memory");
         return {};
     }
     request->data = std::string((char*)data, (char*)data+size);
@@ -338,36 +347,32 @@ ocspRequestFromCert(STACK_OF(X509)* fullchain, const std::shared_ptr<Logger>& lo
 bool
 ocspValidateResponse(const OscpRequestInfo& info, STACK_OF(X509)* fullchain, const std::string& response, X509_STORE *store, const std::shared_ptr<Logger>& logger)
 {
-    ASN1_GENERALIZEDTIME *revtime = nullptr, *thisupd = nullptr, *nextupd = nullptr;
-    const uint8_t* p = (const uint8_t*)response.data();
-    int status, cert_status=0, crl_reason=0;
-    time_t now, rev_t = -1, this_t, next_t;
-
     X509* cert = cert_from_chain(fullchain);
     if (cert == nullptr) {
         if (logger)
-            logger->e("No certificate found");
+            logger->error("ocsp: no certificate found");
         return false;
     }
     X509* issuer = issuer_from_chain(fullchain);
     if (issuer == nullptr) {
         if (logger)
-            logger->e("Unable to find issuer for cert");
+            logger->error("ocsp: unable to find issuer for cert");
         return false;
     }
 
     OCSP_CERTID *cidr;
     if ((cidr = OCSP_cert_to_id(nullptr, cert, issuer)) == nullptr) {
         if (logger)
-            logger->e("Unable to get issuer cert/CID");
+            logger->error("ocsp: unable to get issuer cert/CID");
         return false;
     }
     std::unique_ptr<OCSP_CERTID, decltype(&OCSP_CERTID_free)> cid(cidr, &OCSP_CERTID_free);
 
+    const uint8_t* resp_data = (const uint8_t*)response.data();
     OCSP_RESPONSE *r;
-    if ((r = d2i_OCSP_RESPONSE(nullptr, &p, response.size())) == nullptr) {
+    if ((r = d2i_OCSP_RESPONSE(nullptr, &resp_data, response.size())) == nullptr) {
         if (logger)
-            logger->e("OCSP response unserializable");
+            logger->error("OCSP response unserializable");
         return false;
     }
     std::unique_ptr<OCSP_RESPONSE, decltype(&OCSP_RESPONSE_free)> resp(r, &OCSP_RESPONSE_free);
@@ -375,99 +380,59 @@ ocspValidateResponse(const OscpRequestInfo& info, STACK_OF(X509)* fullchain, con
     OCSP_BASICRESP *brespr;
     if ((brespr = OCSP_response_get1_basic(resp.get())) == nullptr) {
         if (logger)
-            logger->e("Failed to load OCSP response");
+            logger->error("Failed to load OCSP response");
         return false;
     }
     std::unique_ptr<OCSP_BASICRESP, decltype(&OCSP_BASICRESP_free)> bresp(brespr, &OCSP_BASICRESP_free);
 
     if (OCSP_basic_verify(bresp.get(), fullchain, store, OCSP_TRUSTOTHER) != 1) {
         if (logger)
-            logger->w("OCSP verify failed");
+            logger->warn("OCSP verify failed");
         return false;
     }
-    printf("OCSP response signature validated\n");
 
-    status = OCSP_response_status(resp.get());
+    int status = OCSP_response_status(resp.get());
     if (status != OCSP_RESPONSE_STATUS_SUCCESSFUL) {
         if (logger)
-            logger->w("OCSP Failure: code %d (%s)", status, OCSP_response_status_str(status));
+            logger->warn("OCSP Failure: code {:d} ({:s})", status, OCSP_response_status_str(status));
         return false;
     }
 
     // Check the nonce if we sent one
     if (OCSP_check_nonce(info.req.get(), bresp.get()) <= 0) {
         if (logger)
-            logger->w("No OCSP nonce, or mismatch");
+            logger->warn("No OCSP nonce, or mismatch");
         return false;
     }
 
+    ASN1_GENERALIZEDTIME *revtime = nullptr, *thisupd = nullptr, *nextupd = nullptr;
+    int cert_status=0, crl_reason=0;
     if (OCSP_resp_find_status(bresp.get(), cid.get(), &cert_status, &crl_reason,
         &revtime, &thisupd, &nextupd) != 1) {
         if (logger)
-            logger->w("OCSP verify failed: no result for cert");
+            logger->warn("OCSP verify failed: no result for cert");
         return false;
     }
 
-    if (revtime && (rev_t = parse_ocsp_time(revtime)) == -1) {
-        if (logger)
-            logger->w("Unable to parse revocation time in OCSP reply");
-        return false;
-    }
     // Belt and suspenders, Treat it as revoked if there is either
     // a revocation time, or status revoked.
-    if (rev_t != -1 || cert_status == V_OCSP_CERTSTATUS_REVOKED) {
-        if (logger)
-            logger->w("Invalid OCSP reply: certificate is revoked");
-        if (rev_t != -1) {
-            if (logger)
-                logger->w("Certificate revoked at: %s", ctime(&rev_t));
+    if (revtime || cert_status == V_OCSP_CERTSTATUS_REVOKED) {
+        if (logger) {
+            logger->warn("OCSP verify failed: certificate revoked since {}", asn1ToString(revtime));
         }
         return false;
     }
-    if ((this_t = parse_ocsp_time(thisupd)) == -1) {
-        if (logger)
-            logger->w("unable to parse this update time in OCSP reply");
-        return false;
-    }
-    if ((next_t = parse_ocsp_time(nextupd)) == -1) {
-        if (logger)
-            logger->w("unable to parse next update time in OCSP reply");
-        return false;
-    }
 
-    // Don't allow this update to precede next update
-    if (this_t >= next_t) {
+    if (OCSP_check_validity(thisupd, nextupd, 1, -1) == 0) {
         if (logger)
-            logger->w("Invalid OCSP reply: this update >= next update");
-        return false;
-    }
-
-    now = time(nullptr);
-    // Check that this update is not more than JITTER seconds in the future.
-    if (this_t > now + JITTER_SEC) {
-        if (logger)
-            logger->e("Invalid OCSP reply: this update is in the future (%s)", ctime(&this_t));
-        return false;
-    }
-
-    // Check that this update is not more than MAXSEC in the past.
-    if (this_t < now - MAXAGE_SEC) {
-        if (logger)
-            logger->e("Invalid OCSP reply: this update is too old (%s)", ctime(&this_t));
-        return false;
-    }
-
-    // Check that next update is still valid
-    if (next_t < now - JITTER_SEC) {
-        if (logger)
-            logger->w("Invalid OCSP reply: reply has expired (%s)", ctime(&next_t));
+            logger->warn("OCSP reply is expired or not yet valid");
         return false;
     }
 
     if (logger) {
-        logger->d("OCSP response validated");
-        logger->d("	   This Update: %s", ctime(&this_t));
-        logger->d("	   Next Update: %s", ctime(&next_t));
+        logger->debug("OCSP response validated");
+        logger->debug("	   This Update: {}", asn1ToString(thisupd));
+        logger->debug("	   Next Update: {}", asn1ToString(nextupd));
     }
     return true;
 }
@@ -488,7 +453,7 @@ Connection::set_ssl_verification(const std::string& hostname, const asio::ssl::v
                     if (logger) {
                         char subject_name[1024];
                         X509_NAME_oneline(X509_get_subject_name(cert), subject_name, 1024);
-                        logger->d("[connection:%i] verify %s compliance to RFC 2818:\n%s", id, hostname.c_str(), subject_name);
+                        logger->debug("[connection:{:d}] verify {:s} compliance to RFC 2818:\n{:s}", id, hostname, subject_name);
                     }
 
                     // starts from CA and goes down the presented chain
@@ -496,14 +461,14 @@ Connection::set_ssl_verification(const std::string& hostname, const asio::ssl::v
                     bool verified = verifier(preverified, ctx);
                     auto verify_ec = X509_STORE_CTX_get_error(ctx.native_handle());
                     if (verify_ec != 0 /*X509_V_OK*/ and logger)
-                        logger->e("[http::connection:%i] ssl verification error=%i %d", id, verify_ec, verified);
+                        logger->error("[http::connection:{:d}] ssl verification error={:d} {}", id, verify_ec, verified);
                     if (verified and checkOcsp) {
                         std::unique_ptr<stack_st_X509, void(*)(stack_st_X509*)> chain(
                             X509_STORE_CTX_get1_chain(ctx.native_handle()),
                             [](stack_st_X509* c){ sk_X509_pop_free(c, X509_free); });
                         if (auto ocspInfo = ocspRequestFromCert(chain.get(), logger)) {
                             if (logger)
-                                logger->w("[http::connection:%i] TLS OCSP server: %s, request size: %zu", id, ocspInfo->url.c_str(), ocspInfo->data.size());
+                                logger->warn("[http::connection:{:d}] TLS OCSP server: {:s}, request size: {:d}", id, ocspInfo->url, ocspInfo->data.size());
                             bool ocspVerified = false;
                             asio::io_context io_ctx;
                             auto ocspReq = std::make_shared<Request>(io_ctx, ocspInfo->url, [&](const Response& ocspResp){
@@ -511,7 +476,7 @@ Connection::set_ssl_verification(const std::string& hostname, const asio::ssl::v
                                     ocspVerified = ocspValidateResponse(*ocspInfo, chain.get(), ocspResp.body, X509_STORE_CTX_get0_store(ctx.native_handle()), logger);
                                 } else {
                                     if (logger)
-                                        logger->w("[http::connection:%i] TLS OCSP check error", id);
+                                        logger->warn("[http::connection:{:d}] TLS OCSP check error", id);
                                 }
                             }, logger);
                             ocspReq->set_method(restinio::http_method_post());
@@ -571,48 +536,11 @@ Connection::async_connect(std::vector<asio::ip::tcp::endpoint>&& endpoints, Conn
 #pragma GCC diagnostic ignored "-Wunused-variable"
     ConnectHandlerCb wcb = [this, &base, cb=std::move(cb)](const asio::error_code& ec, const asio::ip::tcp::endpoint& endpoint) {
         if (!ec) {
-            auto socket = base.native_handle();
             local_address_ = base.local_endpoint().address();
             // Once connected, set a keep alive on the TCP socket with 30 seconds delay
             // This will generate broken pipes as soon as possible.
             // Note this needs to be done once connected to have a valid native_handle()
-            uint32_t start = 30;
-            uint32_t interval = 30;
-            uint32_t cnt = 1;
-#ifdef _WIN32
-            std::string val = "1";
-            setsockopt(socket, SOL_SOCKET, SO_KEEPALIVE, val.c_str(), sizeof(val));
-
-            // TCP_KEEPIDLE and TCP_KEEPINTVL are available since Win 10 version 1709
-            // TCP_KEEPCNT since Win 10 version 1703
-#ifdef TCP_KEEPIDLE
-            std::string start_str = std::to_string(start);
-            setsockopt(socket, IPPROTO_TCP, TCP_KEEPIDLE,
-                    start_str.c_str(), sizeof(start_str));
-#endif
-#ifdef TCP_KEEPINTVL
-            std::string interval_str = std::to_string(interval);
-            setsockopt(socket, IPPROTO_TCP, TCP_KEEPINTVL,
-                    interval_str.c_str(), sizeof(interval_str));
-#endif
-#ifdef TCP_KEEPCNT
-            std::string cnt_str = std::to_string(cnt);
-            setsockopt(socket, IPPROTO_TCP, TCP_KEEPCNT,
-                    cnt_str.c_str(), sizeof(cnt_str));
-#endif
-#else
-            uint32_t val = 1;
-            setsockopt(socket, SOL_SOCKET, SO_KEEPALIVE, &val, sizeof(uint32_t));
-#ifdef __APPLE__
-            // Apple devices only have one parameter
-            setsockopt(socket, IPPROTO_TCP, TCP_KEEPALIVE, &start, sizeof(uint32_t));
-#else
-            // Linux based systems
-            setsockopt(socket, SOL_TCP, TCP_KEEPIDLE, &start, sizeof(uint32_t));
-            setsockopt(socket, SOL_TCP, TCP_KEEPINTVL, &interval, sizeof(uint32_t));
-            setsockopt(socket, SOL_TCP, TCP_KEEPCNT, &cnt, sizeof(uint32_t));
-#endif
-#endif
+            this->set_keepalive(30);
         }
         if (cb)
             cb(ec, endpoint);
@@ -642,11 +570,11 @@ Connection::async_handshake(HandlerCb cb)
                 if (this_.logger_) {
                     if (verify_ec == X509_V_ERR_DEPTH_ZERO_SELF_SIGNED_CERT /*18*/
                         || verify_ec == X509_V_ERR_SELF_SIGNED_CERT_IN_CHAIN /*19*/)
-                        this_.logger_->d("[connection:%i] self-signed certificate in handshake: %i", this_.id_, verify_ec);
+                        this_.logger_->debug("[connection:{:d}] self-signed certificate in handshake: {:d}", this_.id_, verify_ec);
                     else if (verify_ec != X509_V_OK)
-                        this_.logger_->e("[connection:%i] verify handshake error: %i", this_.id_, verify_ec);
+                        this_.logger_->error("[connection:{:d}] verify handshake error: {:d}", this_.id_, verify_ec);
                     else
-                        this_.logger_->w("[connection:%i] verify handshake success", this_.id_);
+                        this_.logger_->warn("[connection:{:d}] verify handshake success", this_.id_);
                 }
             }
             if (cb)
@@ -728,6 +656,64 @@ Connection::async_read_some(size_t bytes, BytesHandlerCb cb)
     else              socket_->async_read_some(buf, onEnd);
 }
 
+void
+Connection::set_keepalive(uint32_t seconds)
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!ssl_socket_ && !socket_) return;
+
+    auto& base = ssl_socket_? ssl_socket_->lowest_layer() : *socket_;
+    auto socket = base.native_handle();
+
+    uint32_t interval = 1;
+    uint32_t cnt = 10;
+#ifdef _WIN32
+    // TCP_KEEPIDLE and TCP_KEEPINTVL are available since Win 10 version 1709
+    // TCP_KEEPCNT since Win 10 version 1703
+#if defined(TCP_KEEPIDLE) && defined(TCP_KEEPINTVL) && defined(TCP_KEEPCNT)
+    std::string val = "1";
+    setsockopt(socket, SOL_SOCKET, SO_KEEPALIVE, val.c_str(), sizeof(val));
+    std::string seconds_str = std::to_string(seconds);
+    setsockopt(socket, IPPROTO_TCP, TCP_KEEPIDLE,
+        seconds_str.c_str(), sizeof(seconds_str));
+    std::string interval_str = std::to_string(interval);
+    setsockopt(socket, IPPROTO_TCP, TCP_KEEPINTVL,
+        interval_str.c_str(), sizeof(interval_str));
+    std::string cnt_str = std::to_string(cnt);
+    setsockopt(socket, IPPROTO_TCP, TCP_KEEPCNT,
+        cnt_str.c_str(), sizeof(cnt_str));
+#else
+    struct {
+        uint32_t onoff;
+        uint32_t keepalivetime;
+        uint32_t keepaliveinterval;
+    } keepalive;
+    keepalive.onoff = 1;
+    keepalive.keepalivetime = seconds * 1000;
+    keepalive.keepaliveinterval = interval * 1000;
+    int32_t out = 0;
+    WSAIoctl(socket, SIO_KEEPALIVE_VALS, keepalive, sizeof(tcp_keepalive),
+        nullptr, 0, &out, nullptr, nullptr);
+#endif
+#else
+    uint32_t val = 1;
+    setsockopt(socket, SOL_SOCKET, SO_KEEPALIVE, &val, sizeof(uint32_t));
+#ifdef __APPLE__
+    // Old Apple devices only have one parameter
+    setsockopt(socket, IPPROTO_TCP, TCP_KEEPALIVE, &seconds, sizeof(uint32_t));
+#if defined(TCP_KEEPINTVL) && defined(TCP_KEEPCNT)
+    setsockopt(socket, IPPROTO_TCP, TCP_KEEPINTVL, &interval, sizeof(uint32_t));
+    setsockopt(socket, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(uint32_t));
+#endif
+#else
+    // Linux based systems
+    setsockopt(socket, SOL_TCP, TCP_KEEPIDLE, &seconds, sizeof(uint32_t));
+    setsockopt(socket, SOL_TCP, TCP_KEEPINTVL, &interval, sizeof(uint32_t));
+    setsockopt(socket, SOL_TCP, TCP_KEEPCNT, &cnt, sizeof(uint32_t));
+#endif
+#endif
+}
+
 const asio::ip::address&
 Connection::local_address() const
 {
@@ -745,7 +731,7 @@ Connection::timeout(const std::chrono::seconds& timeout, HandlerCb cb)
             return;
         else if (ec){
             if (logger)
-                logger->e("[connection:%i] timeout error: %s", id, ec.message().c_str());
+                logger->error("[connection:{:d}] timeout error: {:s}", id, ec.message());
         }
         if (cb)
             cb(ec);
@@ -795,6 +781,12 @@ Resolver::~Resolver()
     *destroyed_ = true;
 }
 
+void
+Resolver::cancel()
+{
+    resolver_.cancel();
+}
+
 inline
 std::vector<asio::ip::tcp::endpoint>
 filter(const std::vector<asio::ip::tcp::endpoint>& epts, sa_family_t family)
@@ -836,9 +828,8 @@ Resolver::resolve(const std::string& host, const std::string& service)
         if (ec == asio::error::operation_aborted or *destroyed)
             return;
         if (logger_) {
-            if (ec)
-                logger_->e("[http:client] [resolver] error for %s:%s: %s",
-                           host.c_str(), service.c_str(), ec.message().c_str());
+            logger_->error("[http:client] [resolver] result for {:s}:{:s}: {:s}",
+                        host, service, ec.message());
         }
         decltype(cbs_) cbs;
         {
@@ -880,7 +871,7 @@ Request::Request(asio::io_context& ctx, const std::string& url, const Json::Valu
             Json::CharReaderBuilder rbuilder;
             auto reader = std::unique_ptr<Json::CharReader>(rbuilder.newCharReader());
             if (!reader->parse(response.body.data(), response.body.data() + response.body.size(), &json, &err) and logger_)
-                logger_->e("[http:request:%i] can't parse response to json", id_, err.c_str());
+                logger_->error("[http:request:{:d}] can't parse response to json: {:s}", id_, err);
         }
         if (jsoncb)
             jsoncb(std::move(json), response);
@@ -902,7 +893,7 @@ Request::Request(asio::io_context& ctx, const std::string& url, OnJsonCb jsoncb,
             Json::CharReaderBuilder rbuilder;
             auto reader = std::unique_ptr<Json::CharReader>(rbuilder.newCharReader());
             if (!reader->parse(response.body.data(), response.body.data() + response.body.size(), &json, &err) and logger_)
-                logger_->e("[http:request:%i] can't parse response to json", id_, err.c_str());
+                logger_->error("[http:request:{:d}] can't parse response to json: {:s}", id_, err);
         }
         if (jsoncb)
             jsoncb(std::move(json), response);
@@ -970,6 +961,8 @@ Request::init_default_headers()
 void
 Request::cancel()
 {
+    if (auto r = resolver_)
+        r->cancel();
     if (auto c = conn_)
         c->close();
 }
@@ -1066,7 +1059,7 @@ Request::build()
         break;
     case restinio::http_connection_header_t::upgrade:
         if (logger_)
-            logger_->e("Unsupported connection type 'upgrade', fallback to 'close'");
+            logger_->error("Unsupported connection type 'upgrade', fallback to 'close'");
     // fallthrough
     case restinio::http_connection_header_t::close:
         conn_str = "close"; // default
@@ -1082,6 +1075,30 @@ Request::build()
     } else
         request << "\r\n";
     request_ = request.str();
+}
+
+// https://stackoverflow.com/a/17708801
+std::string
+Request::url_encode(std::string_view value)
+{
+    std::ostringstream escaped;
+    escaped.fill('0');
+    escaped << std::hex;
+
+    for (const char& c : value) {
+        // Keep alphanumeric and other accepted characters intact
+        if (std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+            escaped << c;
+            continue;
+        }
+
+        // Any other characters are percent-encoded
+        escaped << std::uppercase;
+        escaped << '%' << std::setw(2) << static_cast<int>(static_cast<unsigned char>(c));
+        escaped << std::nouppercase;
+    }
+
+    return escaped.str();
 }
 
 void
@@ -1120,13 +1137,11 @@ Request::init_parser()
     response_.request = shared_from_this();
 
     if (!parser_)
-        parser_ = std::make_unique<http_parser>();
-    http_parser_init(parser_.get(), HTTP_RESPONSE);
-    parser_->data = static_cast<void*>(this);
+        parser_ = std::make_unique<llhttp_t>();
 
     if (!parser_s_)
-        parser_s_ = std::make_unique<http_parser_settings>();
-    http_parser_settings_init(parser_s_.get());
+        parser_s_ = std::make_unique<llhttp_settings_t>();
+    llhttp_settings_init(parser_s_.get());
 
     cbs_.on_status = [this, statusCb = std::move(cbs_.on_status)](unsigned int status_code){
         response_.status_code = status_code;
@@ -1141,31 +1156,33 @@ Request::init_parser()
         response_.headers[*header_field] = std::string(at, length);
     };
 
-    // http_parser raw c callback (note: no context can be passed into them)
-    parser_s_->on_status = [](http_parser* parser, const char* /*at*/, size_t /*length*/) -> int {
+    // llhttp raw c callback (note: no context can be passed into them)
+    parser_s_->on_status = [](llhttp_t* parser, const char* /*at*/, size_t /*length*/) -> int {
         static_cast<Request*>(parser->data)->cbs_.on_status(parser->status_code);
         return 0;
     };
-    parser_s_->on_header_field = [](http_parser* parser, const char* at, size_t length) -> int {
+    parser_s_->on_header_field = [](llhttp_t* parser, const char* at, size_t length) -> int {
         static_cast<Request*>(parser->data)->cbs_.on_header_field(at, length);
         return 0;
     };
-    parser_s_->on_header_value = [](http_parser* parser, const char* at, size_t length) -> int {
+    parser_s_->on_header_value = [](llhttp_t* parser, const char* at, size_t length) -> int {
         static_cast<Request*>(parser->data)->cbs_.on_header_value(at, length);
         return 0;
     };
-    parser_s_->on_body = [](http_parser* parser, const char* at, size_t length) -> int {
+    parser_s_->on_body = [](llhttp_t* parser, const char* at, size_t length) -> int {
         static_cast<Request*>(parser->data)->onBody(at, length);
         return 0;
     };
-    parser_s_->on_headers_complete = [](http_parser* parser) -> int {
+    parser_s_->on_headers_complete = [](llhttp_t* parser) -> int {
         static_cast<Request*>(parser->data)->onHeadersComplete();
         return 0;
     };
-    parser_s_->on_message_complete = [](http_parser* parser) -> int {
+    parser_s_->on_message_complete = [](llhttp_t* parser) -> int {
         static_cast<Request*>(parser->data)->onComplete();
         return 0;
     };
+    llhttp_init(parser_.get(), HTTP_RESPONSE, parser_s_.get());
+    parser_->data = static_cast<void*>(this);
 }
 
 void
@@ -1173,7 +1190,7 @@ Request::connect(std::vector<asio::ip::tcp::endpoint>&& endpoints, HandlerCb cb)
 {
     if (endpoints.empty()){
         if (logger_)
-            logger_->e("[http:request:%i] connect: no endpoints provided", id_);
+            logger_->error("[http:request:{:d}] connect: no endpoints provided", id_);
         if (cb)
             cb(asio::error::connection_aborted);
         return;
@@ -1182,7 +1199,7 @@ Request::connect(std::vector<asio::ip::tcp::endpoint>&& endpoints, HandlerCb cb)
         std::string eps = "";
         for (const auto& endpoint : endpoints)
             eps.append(endpoint.address().to_string() + ":" + std::to_string(endpoint.port()) + " ");
-        logger_->d("[http:request:%i] connect begin: %s", id_, eps.c_str());
+        logger_->debug("[http:request:{:d}] connect begin: {:s}", id_, eps);
     }
     bool isHttps = get_url().protocol == "https";
     if (isHttps) {
@@ -1213,7 +1230,7 @@ Request::connect(std::vector<asio::ip::tcp::endpoint>&& endpoints, HandlerCb cb)
         }
         else if (ec) {
             if (this_.logger_)
-                this_.logger_->e("[http:request:%i] connect failed with all endpoints: %s", this_.id_, ec.message().c_str());
+                this_.logger_->error("[http:request:{:d}] connect failed with all endpoints: {:s}", this_.id_, ec.message());
         } else {
             const auto& url = this_.get_url();
             auto port = endpoint.port();
@@ -1229,9 +1246,9 @@ Request::connect(std::vector<asio::ip::tcp::endpoint>&& endpoints, HandlerCb cb)
                         if (ec == asio::error::operation_aborted)
                             return;
                         if (ec and logger)
-                            logger->e("[http:request:%i] handshake error: %s", id, ec.message().c_str());
+                            logger->error("[http:request:{:d}] handshake error: {:s}", id, ec.message());
                         //else if (logger)
-                        //    logger->d("[http:request:%i] handshake success", id);
+                        //    logger->d("[http:request:{:d}] handshake success", id);
                         if (cb)
                             cb(ec);
                     });
@@ -1259,7 +1276,7 @@ Request::send()
             std::lock_guard<std::mutex> lock(this_.mutex_);
             if (ec){
                 if (this_.logger_)
-                    this_.logger_->e("[http:request:%i] resolve error: %s", this_.id_, ec.message().c_str());
+                    this_.logger_->error("[http:request:{:d}] resolve error: {:s}", this_.id_, ec.message());
                 this_.terminate(asio::error::connection_aborted);
             }
             else if (!this_.conn_ or !this_.conn_->is_open()) {
@@ -1289,7 +1306,7 @@ Request::post()
     init_parser();
 
     if (logger_)
-        logger_->d("[http:request:%i] sending %zu bytes", id_, request_.size());
+        logger_->debug("[http:request:{}] sending {} bytes", id_, request_.size());
 
     // write the request to buffer
     std::ostream request_stream(&conn_->input());
@@ -1317,12 +1334,12 @@ Request::terminate(const asio::error_code& ec)
 
     if (logger_) {
         if (ec and ec != asio::error::eof and !response_.aborted)
-            logger_->e("[http:request:%i] end with error: %s", id_, ec.message().c_str());
+            logger_->error("[http:request:{:d}] end with error: {:s}", id_, ec.message());
         else
-            logger_->d("[http:request:%i] done with status code %u", id_, response_.status_code);
+            logger_->debug("[http:request:{:d}] done with status code {:d}", id_, response_.status_code);
     }
 
-    if (!parser_ or !http_should_keep_alive(parser_.get()))
+    if (!parser_ or !llhttp_should_keep_alive(parser_.get()))
         if (auto c = conn_)
             c->close();
     notify_state_change(State::DONE);
@@ -1361,17 +1378,15 @@ Request::handle_response(const asio::error_code& ec, size_t /* n_bytes */)
         return;
     }
     auto request = (ec == asio::error::eof) ? std::string{} : conn_->read_bytes();
-    size_t ret = http_parser_execute(parser_.get(), parser_s_.get(), request.c_str(), request.size());
-    if (ret != request.size()) {
+    enum llhttp_errno ret = llhttp_execute(parser_.get(), request.c_str(), request.size());
+    if (ret != HPE_OK && ret != HPE_PAUSED) {
         if (logger_)
-            logger_->e("Error parsing HTTP: %zu %s %s", ret,
-                http_errno_name(HTTP_PARSER_ERRNO(parser_)),
-                http_errno_description(HTTP_PARSER_ERRNO(parser_)));
+            logger_->e("Error parsing HTTP: %zu %s %d", (int)ret, llhttp_errno_name(ret), llhttp_get_error_reason(parser_.get()));
         terminate(asio::error::basic_errors::broken_pipe);
         return;
     }
 
-    if (state_ != State::DONE and parser_ and not http_body_is_final(parser_.get())) {
+    if (state_ != State::DONE and parser_ and not llhttp_message_needs_eof(parser_.get())) {
         auto toRead = parser_->content_length ? std::min<uint64_t>(parser_->content_length, 64 * 1024) : 64 * 1024;
         std::weak_ptr<Request> wthis = shared_from_this();
         conn_->async_read_some(toRead, [wthis](const asio::error_code& ec, size_t bytes){

@@ -42,7 +42,7 @@ cimport opendht_cpp as cpp
 
 import threading
 
-cdef inline void lookup_callback(cpp.vector[cpp.shared_ptr[cpp.IndexValue]]* values, cpp.Prefix* p, void *user_data) with gil:
+cdef inline void lookup_callback(cpp.vector[cpp.shared_ptr[cpp.IndexValue]]* values, cpp.Prefix* p, void *user_data) noexcept with gil:
     cbs = <object>user_data
     if 'lookup' in cbs and cbs['lookup']:
         vals = []
@@ -52,13 +52,13 @@ cdef inline void lookup_callback(cpp.vector[cpp.shared_ptr[cpp.IndexValue]]* val
             vals.append(v)
         cbs['lookup'](vals, p.toString())
 
-cdef inline void shutdown_callback(void* user_data) with gil:
+cdef inline void shutdown_callback(void* user_data) noexcept with gil:
     cbs = <object>user_data
     if 'shutdown' in cbs and cbs['shutdown']:
         cbs['shutdown']()
     ref.Py_DECREF(cbs)
 
-cdef inline bool get_callback(shared_ptr[cpp.Value] value, void *user_data) with gil:
+cdef inline bool get_callback(shared_ptr[cpp.Value] value, void *user_data) noexcept with gil:
     cbs = <object>user_data
     cb = cbs['get']
     f = cbs['filter'] if 'filter' in cbs else None
@@ -66,7 +66,7 @@ cdef inline bool get_callback(shared_ptr[cpp.Value] value, void *user_data) with
     pv._value = value
     return cb(pv) if not f or f(pv) else True
 
-cdef inline bool value_callback(shared_ptr[cpp.Value] value, bool expired, void *user_data) with gil:
+cdef inline bool value_callback(shared_ptr[cpp.Value] value, bool expired, void *user_data) noexcept with gil:
     cbs = <object>user_data
     cb = cbs['valcb']
     f = cbs['filter'] if 'filter' in cbs else None
@@ -74,7 +74,7 @@ cdef inline bool value_callback(shared_ptr[cpp.Value] value, bool expired, void 
     pv._value = value
     return cb(pv, expired) if not f or f(pv) else True
 
-cdef inline void done_callback(bool done, cpp.vector[shared_ptr[cpp.Node]]* nodes, void *user_data) with gil:
+cdef inline void done_callback(bool done, cpp.vector[shared_ptr[cpp.Node]]* nodes, void *user_data) noexcept with gil:
     node_ids = []
     for n in deref(nodes):
         h = NodeEntry()
@@ -86,7 +86,7 @@ cdef inline void done_callback(bool done, cpp.vector[shared_ptr[cpp.Node]]* node
         cbs['done'](done, node_ids)
     ref.Py_DECREF(cbs)
 
-cdef inline void done_callback_simple(bool done, void *user_data) with gil:
+cdef inline void done_callback_simple(bool done, void *user_data) noexcept with gil:
     cbs = <object>user_data
     if 'done' in cbs and cbs['done']:
         cbs['done'](done)
@@ -158,6 +158,15 @@ cdef class SockAddr(object):
         return self.toString().decode()
     def __repr__(self):
         return "<%s '%s'>" % (self.__class__.__name__, str(self))
+    @staticmethod
+    def resolve(str host, str service=None):
+        vals = []
+        result = cpp.SockAddr.resolve(host.encode(), service.encode() if service else b'')
+        for val in result:
+            a = SockAddr()
+            a._addr = val
+            vals.append(a)
+        return vals
 
 cdef class Node(_WithID):
     cdef shared_ptr[cpp.Node] _node
@@ -453,11 +462,31 @@ cdef class Identity(object):
             k._key = self._id.first
             return k
 
+def aesEncrypt(bytes data, str password) -> bytes :
+    cdef size_t d_len = len(data)
+    cdef cpp.uint8_t* d_ptr = <cpp.uint8_t*>data
+    cdef cpp.Blob indat
+    indat.assign(d_ptr, <cpp.uint8_t*>(d_ptr + d_len))
+    cdef cpp.Blob encrypted = cpp.aesEncrypt(indat, password.encode())
+    cdef char* encrypted_c_str = <char *>encrypted.data()
+    cdef Py_ssize_t length = encrypted.size()
+    return encrypted_c_str[:length]
+
+def aesDecrypt(bytes data, str password) -> bytes :
+    cdef size_t d_len = len(data)
+    cdef cpp.uint8_t* d_ptr = <cpp.uint8_t*>data
+    cdef cpp.Blob indat
+    indat.assign(d_ptr, <cpp.uint8_t*>(d_ptr + d_len))
+    cdef cpp.Blob decrypted = cpp.aesDecrypt(indat, password.encode())
+    cdef char* decrypted_c_str = <char *>decrypted.data()
+    cdef Py_ssize_t length = decrypted.size()
+    return decrypted_c_str[:length]
+
 cdef class DhtConfig(object):
     cdef cpp.DhtRunnerConfig _config
     def __init__(self):
         self._config = cpp.DhtRunnerConfig()
-        self._config.threaded = True;
+        self._config.threaded = True
     def setIdentity(self, Identity id):
         self._config.dht_config.id = id._id
     def setBootstrapMode(self, bool bootstrap):
@@ -471,6 +500,19 @@ cdef class DhtConfig(object):
     def setRateLimit(self, ssize_t max_req_per_sec, ssize_t max_peer_req_per_sec):
         self._config.dht_config.node_config.max_req_per_sec = max_req_per_sec
         self._config.dht_config.node_config.max_peer_req_per_sec = max_peer_req_per_sec
+    def setProxyInfo(self, str proxy_server, str push_node_id="", str push_token="", str push_topic="", str push_platform="", Certificate server_ca = Certificate()):
+        self._config.proxy_server = proxy_server.encode()
+        self._config.push_node_id = push_node_id.encode()
+        self._config.push_token = push_token.encode()
+        self._config.push_topic = push_topic.encode()
+        self._config.push_platform = push_platform.encode()
+        self._config.server_ca = server_ca._cert
+    def setPeerDiscovery(self, bool peer_discovery, bool peer_publish):
+        self._config.peer_discovery = peer_discovery
+        self._config.peer_publish = peer_publish
+    def setBound(self, SockAddr bind4, SockAddr bind6):
+        self._config.bind4 = bind4._addr
+        self._config.bind6 = bind6._addr
 
 cdef class DhtRunner(_WithID):
     cdef cpp.shared_ptr[cpp.DhtRunner] thisptr
@@ -587,7 +629,8 @@ cdef class DhtRunner(_WithID):
                 while pending > 0:
                     lock.wait()
             return res
-    def put(self, InfoHash key, Value val, done_cb=None):
+
+    def put(self, InfoHash key, Value val, done_cb=None, permanent=False):
         """Publish a new value on the DHT at key.
 
         key     -- the DHT key where to put the value
@@ -597,7 +640,7 @@ cdef class DhtRunner(_WithID):
         if done_cb:
             cb_obj = {'done':done_cb}
             ref.Py_INCREF(cb_obj)
-            self.thisptr.get().put(key._infohash, val._value, cpp.bindDoneCb(done_callback, <void*>cb_obj))
+            self.thisptr.get().put(key._infohash, val._value, cpp.bindDoneCb(done_callback, <void*>cb_obj), cpp.time_point.max(), permanent)
         else:
             lock = threading.Condition()
             pending = 0
@@ -614,6 +657,76 @@ cdef class DhtRunner(_WithID):
                 while pending > 0:
                     lock.wait()
             return ok
+
+    def putSigned(self, InfoHash key, Value val, done_cb=None, permanent=False):
+        if done_cb:
+            cb_obj = {'done':done_cb}
+            ref.Py_INCREF(cb_obj)
+            self.thisptr.get().putSigned(key._infohash, val._value, cpp.bindDoneCb(done_callback, <void*>cb_obj), permanent)
+        else:
+            lock = threading.Condition()
+            pending = 0
+            ok = False
+            def tmp_done(ok_ret, nodes):
+                nonlocal pending, ok, lock
+                with lock:
+                    ok = ok_ret
+                    pending -= 1
+                    lock.notify()
+            with lock:
+                pending += 1
+                self.putSigned(key, val, done_cb=tmp_done)
+                while pending > 0:
+                    lock.wait()
+            return ok
+
+    def putEncrypted(self, InfoHash key, InfoHash to, Value val, done_cb=None, bool permanent=False):
+        if done_cb:
+            cb_obj = {'done':done_cb}
+            ref.Py_INCREF(cb_obj)
+            self.thisptr.get().putEncrypted(key._infohash, to._infohash, val._value, cpp.bindDoneCb(done_callback, <void*>cb_obj), permanent)
+        else:
+            lock = threading.Condition()
+            pending = 0
+            ok = False
+            def tmp_done(ok_ret, nodes):
+                nonlocal pending, ok, lock
+                with lock:
+                    ok = ok_ret
+                    pending -= 1
+                    lock.notify()
+            with lock:
+                pending += 1
+                self.putEncrypted(key, to, val, done_cb=tmp_done, permanent=permanent)
+                while pending > 0:
+                    lock.wait()
+            return ok
+
+    def putEncrypted(self, InfoHash key, PublicKey to, Value val, done_cb=None, bool permanent=False):
+        if done_cb:
+            cb_obj = {'done':done_cb}
+            ref.Py_INCREF(cb_obj)
+            self.thisptr.get().putEncrypted(key._infohash, to._key, val._value, cpp.bindDoneCb(done_callback, <void*>cb_obj), permanent)
+        else:
+            lock = threading.Condition()
+            pending = 0
+            ok = False
+            def tmp_done(ok_ret, nodes):
+                nonlocal pending, ok, lock
+                with lock:
+                    ok = ok_ret
+                    pending -= 1
+                    lock.notify()
+            with lock:
+                pending += 1
+                self.putEncrypted(key, to, val, done_cb=tmp_done, permanent=permanent)
+                while pending > 0:
+                    lock.wait()
+            return ok
+
+    def cancelPut(self, InfoHash key, Value val):
+        self.thisptr.get().cancelPut(key._infohash, val._value)
+
     def listen(self, InfoHash key, value_cb):
         t = ListenToken()
         t._h = key._infohash

@@ -1,6 +1,6 @@
 dnl define macros
-m4_define([opendht_major_version], 2)
-m4_define([opendht_minor_version], 6)
+m4_define([opendht_major_version], 3)
+m4_define([opendht_minor_version], 2)
 m4_define([opendht_patch_version], 0)
 m4_define([opendht_version],
 		  [opendht_major_version.opendht_minor_version.opendht_patch_version])
@@ -21,10 +21,10 @@ AS_IF([test "x$enable_debug" = "xyes"],
       [CXXFLAGS="${CXXFLAGS} -g -Og -Wno-return-type -Wall -Wextra -Wnon-virtual-dtor -Wno-deprecated -pedantic-errors"],
       [CXXFLAGS="${CXXFLAGS} -O3 -Wno-deprecated -pedantic-errors -fvisibility=hidden"])
 
-CPPFLAGS+=" -DOPENDHT_BUILD"
+CPPFLAGS="${CPPFLAGS} -DOPENDHT_BUILD"
 AM_CONDITIONAL([OPENDHT_SHARED], [test "x$enable_shared" != xno])
 AM_COND_IF(OPENDHT_SHARED, [
-  CPPFLAGS+=" -Dopendht_EXPORTS"
+  CPPFLAGS="${CPPFLAGS} -Dopendht_EXPORTS"
 ])
 
 AM_PROG_AR
@@ -147,7 +147,7 @@ AS_IF([test "x$with_jsoncpp" != "xno"],
       [have_jsoncpp=no])
 AS_IF([test "x$have_jsoncpp" = "xyes"], [
     AC_MSG_NOTICE([Using JsonCpp])
-    CPPFLAGS+=" -DOPENDHT_JSONCPP"
+    CPPFLAGS="${CPPFLAGS} -DOPENDHT_JSONCPP"
     AC_SUBST(jsoncpp_lib, [", jsoncpp"])
 ], [
     AC_MSG_NOTICE([Not using JsonCpp])
@@ -175,11 +175,11 @@ AS_IF([test "x$have_fmt" = "xyes"], [
 AM_COND_IF([PROXY_CLIENT_OR_SERVER], [
     AC_CHECK_HEADERS([asio.hpp],, AC_MSG_ERROR([Missing Asio headers files]))
     CXXFLAGS="${CXXFLAGS} -DASIO_STANDALONE"
-    # http_parser has no pkgconfig, instead we check with:
-    AC_CHECK_LIB(http_parser, exit,, AC_MSG_ERROR([Missing HttpParser library files]))
-    AC_CHECK_HEADERS([http_parser.h], [http_parser_headers=yes; break;])
-    AC_SUBST(http_parser_lib, ["-lhttp_parser"])
-    AS_IF([test "x$http_parser_headers" != "xyes"], AC_MSG_ERROR([Missing HttpParser headers files]))
+    # llhttp has no pkgconfig, instead we check with:
+    AC_CHECK_LIB(llhttp, exit,, AC_MSG_ERROR([Missing llhttp library files]))
+    AC_CHECK_HEADERS([llhttp.h], [llhttp_headers=yes; break;])
+    AC_SUBST(http_lib, ["-lllhttp"])
+    AS_IF([test "x$llhttp_headers" != "xyes"], AC_MSG_ERROR([Missing llhttp headers files]))
 ])
 
 CXXFLAGS="${CXXFLAGS} -DMSGPACK_NO_BOOST -DMSGPACK_DISABLE_LEGACY_NIL -DMSGPACK_DISABLE_LEGACY_CONVERT"
@@ -194,8 +194,8 @@ AM_COND_IF([ENABLE_TOOLS], [
 
 AM_COND_IF(ENABLE_PROXY_SERVER, AC_DEFINE([OPENDHT_PROXY_SERVER], [], [Building with proxy server]))
 AM_COND_IF(ENABLE_PROXY_CLIENT, AC_DEFINE([OPENDHT_PROXY_CLIENT], [], [Building with proxy client]))
-AM_COND_IF(ENABLE_PUSH_NOTIFICATIONS, [CPPFLAGS+=" -DOPENDHT_PUSH_NOTIFICATIONS"], [])
-AM_COND_IF(ENABLE_PROXY_SERVER_IDENTITY, [CPPFLAGS+=" -DOPENDHT_PROXY_SERVER_IDENTITY"], [])
+AM_COND_IF(ENABLE_PUSH_NOTIFICATIONS, [CPPFLAGS="${CPPFLAGS} -DOPENDHT_PUSH_NOTIFICATIONS"], [])
+AM_COND_IF(ENABLE_PROXY_SERVER_IDENTITY, [CPPFLAGS="${CPPFLAGS} -DOPENDHT_PROXY_SERVER_IDENTITY"], [])
 
 dnl Configure setup.py if we build the python module
 AC_SUBST(CURRENT_SOURCE_DIR, ".")

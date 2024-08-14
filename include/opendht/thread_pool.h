@@ -37,7 +37,7 @@ public:
     static ThreadPool& io();
 
     ThreadPool();
-    ThreadPool(size_t maxThreads);
+    ThreadPool(unsigned minThreads, unsigned maxThreads = 0);
     ~ThreadPool();
 
     void run(std::function<void()>&& cb);
@@ -61,8 +61,9 @@ public:
         return get(std::move(cb));
     }
 
-    void stop();
+    void stop(bool wait = true);
     void join();
+    void detach();
 
 private:
     std::mutex lock_ {};
@@ -72,7 +73,12 @@ private:
     unsigned readyThreads_ {0};
     bool running_ {true};
 
+    unsigned minThreads_;
     const unsigned maxThreads_;
+    std::chrono::steady_clock::duration threadExpirationDelay {std::chrono::minutes(5)};
+    double threadDelayRatio_ {2};
+
+    void threadEnded(std::thread&);
 };
 
 class OPENDHT_PUBLIC Executor : public std::enable_shared_from_this<Executor> {

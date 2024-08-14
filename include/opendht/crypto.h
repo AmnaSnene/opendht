@@ -670,94 +670,6 @@ private:
     gnutls_x509_trust_list_t trust {nullptr};
 };
 
-template <class T>
-class OPENDHT_PUBLIC secure_vector
-{
-public:
-    secure_vector() {}
-    secure_vector(secure_vector<T> const&) = default;
-    secure_vector(secure_vector<T> &&) = default;
-    explicit secure_vector(unsigned size): data_(size) {}
-    explicit secure_vector(unsigned size, T _item): data_(size, _item) {}
-    explicit secure_vector(const std::vector<T>& c): data_(c) {}
-    secure_vector(std::vector<T>&& c): data_(std::move(c)) {}
-    ~secure_vector() { clean(); }
-
-    static secure_vector<T> getRandom(size_t size) {
-        secure_vector<T> ret(size);
-        crypto::random_device rdev;
-#ifdef _WIN32
-        std::uniform_int_distribution<int> rand_byte{ 0, std::numeric_limits<uint8_t>::max() };
-#else
-        std::uniform_int_distribution<uint8_t> rand_byte;
-#endif
-        std::generate_n((uint8_t*)ret.data_.data(), ret.size()*sizeof(T), std::bind(rand_byte, std::ref(rdev)));
-        return ret;
-    }
-    secure_vector<T>& operator=(const secure_vector<T>& c) {
-        if (&c == this)
-            return *this;
-        clean();
-        data_ = c.data_;
-        return *this;
-    }
-    secure_vector<T>& operator=(secure_vector<T>&& c) {
-        if (&c == this)
-            return *this;
-        clean();
-        data_ = std::move(c.data_);
-        return *this;
-    }
-    secure_vector<T>& operator=(std::vector<T>&& c) {
-        clean();
-        data_ = std::move(c);
-        return *this;
-    }
-    std::vector<T>& writable() { clean(); return data_; }
-    const std::vector<T>& makeInsecure() const { return data_; }
-    const uint8_t* data() const { return data_.data(); }
-
-    void clean() {
-        clean(data_.begin(), data_.end());
-    }
-
-    void clear() { clean(); data_.clear(); }
-
-    size_t size() const { return data_.size(); }
-    bool empty() const { return data_.empty(); }
-
-    void swap(secure_vector<T>& other) { data_.swap(other.data_); }
-    void resize(size_t s) {
-        if (s == data_.size()) return;
-        if (s < data_.size()) {
-            //shrink
-            clean(data_.begin()+s, data_.end());
-            data_.resize(s);
-        } else {
-            //grow
-            auto data = std::move(data_); // move protected data
-            clear();
-            data_.resize(s);
-            std::copy(data.begin(), data.end(), data_.begin());
-            clean(data.begin(), data.end());
-        }
-    }
-
-private:
-    /**
-     * Securely wipe memory
-     */
-    static void clean(const typename std::vector<T>::iterator& i, const typename std::vector<T>::iterator& j) {
-        volatile uint8_t* b = reinterpret_cast<uint8_t*>(&*i);
-        volatile uint8_t* e = reinterpret_cast<uint8_t*>(&*j);
-        std::fill(b, e, 0);
-    }
-
-    std::vector<T> data_;
-};
-
-using SecureBlob = secure_vector<uint8_t>;
-
 /**
  * Generate an RSA key pair (4096 bits) and a certificate.
  * @param name the name used in the generated certificate
@@ -772,6 +684,7 @@ OPENDHT_PUBLIC Identity generateEcIdentity(const std::string& name, const Identi
 OPENDHT_PUBLIC Identity generateEcIdentity(const std::string& name = "dhtnode", const Identity& ca = {});
 
 OPENDHT_PUBLIC void saveIdentity(const Identity& id, const std::string& path, const std::string& privkey_password = {});
+OPENDHT_PUBLIC Identity loadIdentity(const std::string &path,const std::string &privkey_password = {});
 
 /**
  * Performs SHA512, SHA256 or SHA1, depending on hash_length.
@@ -792,7 +705,7 @@ OPENDHT_PUBLIC void hash(const uint8_t* data, size_t data_length, uint8_t* hash,
  * that can be transmitted in clear, and will be generated if
  * not provided (32 bytes).
  */
-OPENDHT_PUBLIC Blob stretchKey(const std::string& password, Blob& salt, size_t key_length = 512/8);
+OPENDHT_PUBLIC Blob stretchKey(std::string_view password, Blob& salt, size_t key_length = 512/8);
 
 /**
  * AES-GCM encryption. Key must be 128, 192 or 256 bits long (16, 24 or 32 bytes).
@@ -801,15 +714,58 @@ OPENDHT_PUBLIC Blob aesEncrypt(const uint8_t* data, size_t data_length, const Bl
 OPENDHT_PUBLIC inline Blob aesEncrypt(const Blob& data, const Blob& key) {
     return aesEncrypt(data.data(), data.size(), key);
 }
-OPENDHT_PUBLIC Blob aesEncrypt(const Blob& data, const std::string& password);
+/**
+ * AES-GCM encryption with argon2 key derivation.
+ * This function uses `stretchKey` to generate an AES key from the password and a random salt.
+ * The result is a bundle including the salt that can be decrypted with `aesDecrypt(data, password)`.
+ * If needed, the salt or encrypted data can be individually extracted from the bundle with `aesGetSalt` and `aesGetEncrypted`.
+ * @param data: data to encrypt
+ * @param password: password to encrypt the data with
+ * @param salt: optional salt to use for key derivation. If not provided, a random salt will be generated.
+ */
+OPENDHT_PUBLIC Blob aesEncrypt(const Blob& data, std::string_view password, const Blob& salt = {});
 
 /**
  * AES-GCM decryption.
  */
 OPENDHT_PUBLIC Blob aesDecrypt(const uint8_t* data, size_t data_length, const Blob& key);
 OPENDHT_PUBLIC inline Blob aesDecrypt(const Blob& data, const Blob& key) { return aesDecrypt(data.data(), data.size(), key); }
-OPENDHT_PUBLIC Blob aesDecrypt(const uint8_t* data, size_t data_length, const std::string& password);
-OPENDHT_PUBLIC inline Blob aesDecrypt(const Blob& data, const std::string& password) { return aesDecrypt(data.data(), data.size(), password); }
+OPENDHT_PUBLIC inline Blob aesDecrypt(std::string_view data, const Blob& key) { return aesDecrypt((uint8_t*)data.data(), data.size(), key); }
+
+OPENDHT_PUBLIC Blob aesDecrypt(const uint8_t* data, size_t data_length, std::string_view password);
+OPENDHT_PUBLIC inline Blob aesDecrypt(const Blob& data, std::string_view password) { return aesDecrypt(data.data(), data.size(), password); }
+OPENDHT_PUBLIC inline Blob aesDecrypt(std::string_view data, std::string_view password) { return aesDecrypt((uint8_t*)data.data(), data.size(), password); }
+
+/**
+ * Get raw AES key from password and salt stored with the encrypted data.
+ */
+OPENDHT_PUBLIC Blob aesGetKey(const uint8_t* data, size_t data_length, std::string_view password);
+OPENDHT_PUBLIC Blob inline aesGetKey(const Blob& data, std::string_view password) {
+    return aesGetKey(data.data(), data.size(), password);
+}
+/** Get the salt part of data password-encrypted with `aesEncrypt(data, password)` */
+OPENDHT_PUBLIC Blob aesGetSalt(const uint8_t* data, size_t data_length);
+OPENDHT_PUBLIC Blob inline aesGetSalt(const Blob& data) {
+    return aesGetSalt(data.data(), data.size());
+}
+/** Get the encrypted data part of data password-encrypted with `aesEncrypt(data, password)` */
+OPENDHT_PUBLIC std::string_view aesGetEncrypted(const uint8_t* data, size_t data_length);
+OPENDHT_PUBLIC std::string_view inline aesGetEncrypted(const Blob& data) {
+    return aesGetEncrypted(data.data(), data.size());
+}
+
+/** Build an encrypted bundle that can be decrypted with aesDecrypt(data, password).
+ *  @param encryptedData: result of `aesEncrypt(data, key)` or `aesGetEncrypted`
+ *  @param salt: should match the encryption key and password so that `stretchKey(password, salk) == key`.
+ *  Can be obtained from an existing bundle with `aesGetSalt`.
+ **/
+OPENDHT_PUBLIC Blob aesBuildEncrypted(const uint8_t* encryptedData, size_t data_length, const Blob& salt);
+OPENDHT_PUBLIC Blob inline aesBuildEncrypted(const Blob& encryptedData, const Blob& salt) {
+    return aesBuildEncrypted(encryptedData.data(), encryptedData.size(), salt);
+}
+OPENDHT_PUBLIC Blob inline aesBuildEncrypted(std::string_view encryptedData, const Blob& salt) {
+    return aesBuildEncrypted((const uint8_t*)encryptedData.data(), encryptedData.size(), salt);
+}
 
 }
 }

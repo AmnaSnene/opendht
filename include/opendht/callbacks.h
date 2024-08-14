@@ -143,6 +143,9 @@ struct OPENDHT_PUBLIC Config {
      *   - Larger listen refresh time
      */
     bool public_stable {false};
+
+    /* Client mode, node will not be used by other nodes to store data. */
+    bool client_mode {false};
 };
 
 /**
@@ -170,19 +173,19 @@ using ValueCallback = std::function<bool(const std::vector<std::shared_ptr<Value
 using GetCallbackSimple = std::function<bool(std::shared_ptr<Value> value)>;
 using ShutdownCallback = std::function<void()>;
 using IdentityAnnouncedCb = std::function<void(bool)>;
+using PublicAddressChangedCb = std::function<void(std::vector<SockAddr>)>;
 
 using CertificateStoreQuery = std::function<std::vector<std::shared_ptr<crypto::Certificate>>(const InfoHash& pk_id)>;
+using DoneCallback = std::function<void(bool success, const std::vector<std::shared_ptr<Node>>& nodes)>;
+using DoneCallbackSimple = std::function<void(bool success)>;
 
 typedef bool (*GetCallbackRaw)(std::shared_ptr<Value>, void *user_data);
 typedef bool (*ValueCallbackRaw)(std::shared_ptr<Value>, bool expired, void *user_data);
-
-using DoneCallback = std::function<void(bool success, const std::vector<std::shared_ptr<Node>>& nodes)>;
 typedef void (*DoneCallbackRaw)(bool, std::vector<std::shared_ptr<Node>>*, void *user_data);
 typedef void (*ShutdownCallbackRaw)(void *user_data);
 typedef void (*DoneCallbackSimpleRaw)(bool, void *user_data);
 typedef bool (*FilterRaw)(const Value&, void *user_data);
 
-using DoneCallbackSimple = std::function<void(bool success)>;
 
 OPENDHT_PUBLIC GetCallbackSimple bindGetCb(GetCallbackRaw raw_cb, void* user_data);
 OPENDHT_PUBLIC GetCallback bindGetCb(GetCallbackSimple cb);

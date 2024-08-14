@@ -21,28 +21,19 @@ from libcpp.string cimport string
 from libcpp.vector cimport vector
 from libcpp.utility cimport pair
 from libcpp.map cimport map
+from libcpp.memory cimport shared_ptr, make_shared
 from libc.string cimport const_char, const_uchar
 
 ctypedef uint16_t in_port_t
 ctypedef unsigned short int sa_family_t;
 
-cdef extern from "<iostream>" namespace "std::chrono" nogil:
+cdef extern from "<chrono>" namespace "std::chrono" nogil:
     cdef cppclass duration[ulong]:
         duration() except +
 
     cdef cppclass seconds:
         duration seconds(uint64_t) except +
         duration seconds()
-
-cdef extern from "<memory>" namespace "std" nogil:
-    cdef cppclass shared_ptr[T]:
-        shared_ptr() except +
-        shared_ptr(T*) except +
-        T* get()
-        T operator*()
-        bool operator bool() const
-        void reset(T*)
-    shared_ptr[T] make_shared[T](...) except +
 
 cdef extern from "<functional>" namespace "std" nogil:
     cdef cppclass hash[T]:
@@ -58,6 +49,13 @@ cdef extern from "<future>" namespace "std" nogil:
         future() except +
         bool valid() const
         shared_future[T] share()
+
+cdef extern from "opendht/utils.h" namespace "dht":
+    cdef cppclass time_point:
+        @staticmethod
+        time_point min() const
+        @staticmethod
+        time_point max() const
 
 cdef extern from "opendht/infohash.h" namespace "dht":
     cdef cppclass InfoHash:
@@ -88,12 +86,16 @@ cdef extern from "opendht/sockaddr.h" namespace "dht":
         bool isLoopback() const
         bool isPrivate() const
         bool isUnspecified() const
+        @staticmethod
+        vector[SockAddr] resolve(string host, string service) except +
 
 ctypedef vector[uint8_t] Blob
 
 cdef extern from "opendht/crypto.h" namespace "dht::crypto":
     ctypedef pair[shared_ptr[PrivateKey], shared_ptr[Certificate]] Identity
     cdef Identity generateIdentity(string name, Identity ca, unsigned bits)
+    cdef Blob aesEncrypt(Blob data, string password) except +
+    cdef Blob aesDecrypt(Blob encrypted, string password) except +
 
     cdef cppclass PrivateKey:
         PrivateKey()
@@ -239,6 +241,18 @@ cdef extern from "opendht/dhtrunner.h" namespace "dht":
         cppclass Config:
             SecureDhtConfig dht_config
             bool threaded
+            string proxy_server
+            string push_node_id
+            string push_token
+            string push_topic
+            string push_platform
+            bool peer_discovery
+            bool peer_publish
+            shared_ptr[Certificate] server_ca
+            Identity client_identity
+            SockAddr bind4
+            SockAddr bind6
+
         InfoHash getId() const
         InfoHash getNodeId() const
         void bootstrap(const_char*, const_char*)
@@ -254,7 +268,11 @@ cdef extern from "opendht/dhtrunner.h" namespace "dht":
         string getRoutingTablesLog(sa_family_t af) const
         string getSearchesLog(sa_family_t af) const
         void get(InfoHash key, GetCallback get_cb, DoneCallback done_cb, nullptr_t f, Where w)
-        void put(InfoHash key, shared_ptr[Value] val, DoneCallback done_cb)
+        void put(InfoHash key, shared_ptr[Value] val, DoneCallback done_cb, time_point created, bool permanent)
+        void putSigned(InfoHash key, shared_ptr[Value] val, DoneCallback done_cb, bool permanent) 
+        void putEncrypted(InfoHash key, InfoHash to, shared_ptr[Value] val, DoneCallback done_cb, bool permanent)
+        void putEncrypted(InfoHash key, shared_ptr[PublicKey] to, shared_ptr[Value] val, DoneCallback done_cb, bool permanent)
+        void cancelPut(InfoHash key, shared_ptr[Value] val)
         ListenToken listen(InfoHash key, ValueCallback get_cb)
         void cancelListen(InfoHash key, SharedListenToken token)
         vector[unsigned] getNodeMessageStats(bool i)

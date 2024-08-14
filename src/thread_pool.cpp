@@ -23,6 +23,7 @@
 #include <thread>
 #include <iostream>
 #include <ciso646> // fix windows compiler bug
+#include <cmath> // std::pow
 
 namespace dht {
 
@@ -38,18 +39,23 @@ ThreadPool::computation()
 ThreadPool&
 ThreadPool::io()
 {
-    static ThreadPool pool(IO_THREADS_MAX);
+    static ThreadPool pool(std::thread::hardware_concurrency(), IO_THREADS_MAX);
     return pool;
 }
 
 
-ThreadPool::ThreadPool(size_t maxThreads) : maxThreads_(maxThreads)
+ThreadPool::ThreadPool(unsigned minThreads, unsigned maxThreads)
+ : minThreads_(std::max(minThreads, 1u))
+ , maxThreads_(maxThreads ? std::max(minThreads_, maxThreads) : minThreads_)
 {
     threads_.reserve(maxThreads_);
+    if (minThreads_ != maxThreads_) {
+        threadDelayRatio_ = std::pow(3, 1.0 / (maxThreads_ - minThreads_));
+    }
 }
 
 ThreadPool::ThreadPool()
- : ThreadPool(std::max<size_t>(std::thread::hardware_concurrency(), 4))
+ : ThreadPool(std::max(std::thread::hardware_concurrency(), 4u))
 {}
 
 ThreadPool::~ThreadPool()
@@ -66,7 +72,9 @@ ThreadPool::run(std::function<void()>&& cb)
     // launch new thread if necessary
     if (not readyThreads_ && threads_.size() < maxThreads_) {
         try {
-            threads_.emplace_back(std::make_unique<std::thread>([this]() {
+            bool permanent_thread = threads_.size() < minThreads_;
+            auto& thread = *threads_.emplace_back(std::make_unique<std::thread>());
+            thread = std::thread([this, permanent_thread, e=threadExpirationDelay, &thread]() {
                 while (true) {
                     std::function<void()> task;
 
@@ -74,11 +82,13 @@ ThreadPool::run(std::function<void()>&& cb)
                     {
                         std::unique_lock<std::mutex> l(lock_);
                         readyThreads_++;
-                        cv_.wait(l, [&](){
-                            return not running_ or not tasks_.empty();
-                        });
+                        auto waitCond = [&](){ return not running_ or not tasks_.empty(); };
+                        if (permanent_thread)
+                            cv_.wait(l, waitCond);
+                        else
+                            cv_.wait_for(l, e, waitCond);
                         readyThreads_--;
-                        if (not running_)
+                        if (not running_ or tasks_.empty())
                             break;
                         task = std::move(tasks_.front());
                         tasks_.pop();
@@ -92,7 +102,9 @@ ThreadPool::run(std::function<void()>&& cb)
                         std::cerr << "Exception running task: " << e.what() << std::endl;
                     }
                 }
-            }));
+                if (not permanent_thread)
+                    threadEnded(thread);
+            });
         } catch(const std::exception& e) {
             std::cerr << "Exception starting thread: " << e.what() << std::endl;
             if (threads_.empty())
@@ -108,9 +120,37 @@ ThreadPool::run(std::function<void()>&& cb)
 }
 
 void
-ThreadPool::stop()
+ThreadPool::threadEnded(std::thread& thread)
 {
     std::lock_guard<std::mutex> l(lock_);
+    tasks_.emplace([this,t=std::reference_wrapper<std::thread>(thread)]{
+        std::lock_guard<std::mutex> l(lock_);
+        for (auto it = threads_.begin(); it != threads_.end(); ++it) {
+            if (&*(*it) == &t.get()) {
+                t.get().join();
+                threads_.erase(it);
+                break;
+            }
+        }
+    });
+    // A thread expired, maybe after handling a one-time burst of tasks.
+    // If new threads start later, increase the expiration delay.
+    if (threadExpirationDelay > std::chrono::hours(24 * 7)) {
+        // If we reach 7 days, assume the thread is regularly used at full capacity
+        minThreads_ = std::min(minThreads_+1, maxThreads_);
+    } else {
+        threadExpirationDelay *= threadDelayRatio_;
+    }
+    cv_.notify_one();
+}
+
+void
+ThreadPool::stop(bool wait)
+{
+    std::unique_lock<std::mutex> l(lock_);
+    if (wait) {
+        cv_.wait(l, [&](){ return tasks_.empty(); });
+    }
     running_ = false;
     tasks_ = {};
     cv_.notify_all();
@@ -123,6 +163,17 @@ ThreadPool::join()
     for (auto& t : threads_)
         t->join();
     threads_.clear();
+    tasks_ = {};
+}
+
+void
+ThreadPool::detach()
+{
+    stop(false);
+    for (auto& t : threads_)
+        t->detach();
+    threads_.clear();
+    tasks_ = {};
 }
 
 void

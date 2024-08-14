@@ -89,6 +89,9 @@ public:
      * Get the ID of the node.
      */
     inline const InfoHash& getNodeId() const override { return myid; }
+    void setOnPublicAddressChanged(PublicAddressChangedCb cb) override {
+        publicAddressChangedCb_ = std::move(cb);
+    }
 
     /**
      * Get the current status of the node for the given family.
@@ -288,6 +291,11 @@ public:
         loopSignal_();
     }
 
+    void listenKeepIdle(uint32_t seconds) {
+        listenKeepIdle_ = seconds;
+    }
+    inline uint32_t listenKeepIdle() { return listenKeepIdle_; }
+
 private:
     /**
      * Start the connection with a server.
@@ -357,6 +365,7 @@ private:
     SockAddr publicAddressV4_;
     SockAddr publicAddressV6_;
     std::atomic_bool launchConnectedCbs_ {false};
+    PublicAddressChangedCb publicAddressChangedCb_ {};
 
     InfoHash myid {};
 
@@ -386,6 +395,11 @@ private:
     mutable std::mutex searchLock_;
     size_t listenerToken_ {0};
     std::map<InfoHash, ProxySearch> searches_;
+
+    /**
+     * Keepalive idle time for listen
+     */
+    uint32_t listenKeepIdle_ {120};
 
     /**
      * Callbacks should be executed in the main thread.
